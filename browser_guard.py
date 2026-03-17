@@ -892,8 +892,567 @@ class BrowserSession:
 
 
 # ---------------------------------------------------------------------------
+# UI imports  (stdlib; not needed by backend classes above)
+# ---------------------------------------------------------------------------
+
+import queue
+
+# ---------------------------------------------------------------------------
+# UI constants
+# ---------------------------------------------------------------------------
+
+_CONFIG_DIR:  pathlib.Path = pathlib.Path.home() / ".browserguard"
+_CONFIG_FILE: pathlib.Path = _CONFIG_DIR / "config.json"
+_TOOLBAR_H:   int          = 48
+_SIDEBAR_W:   int          = 260
+
+# ---------------------------------------------------------------------------
+# BrowserGuardApp
+# ---------------------------------------------------------------------------
+
+
+class BrowserGuardApp:
+    """Root application controller and main window for BrowserGuard."""
+
+    # ======================================================================
+    # Construction
+    # ======================================================================
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+
+        # ---- mutable state -----------------------------------------------
+        self.sessions:      Dict[str, BrowserSession] = {}
+        self.session_cards: Dict[str, tk.Frame]        = {}
+        self.proxy_list:    List[str]                  = []
+        self.website_list:  List[str]                  = []
+        self.proxy_index:   int                        = 0
+        self.log_queue:     queue.Queue                = queue.Queue()
+        self._sid_counter:  int                        = 0
+
+        # ---- browser discovery state -------------------------------------
+        self._selected_browser: str          = "auto"
+        self._brave_path:       Optional[str] = None
+        self._chrome_path:      Optional[str] = None
+        self._browser_path:     Optional[str] = None
+
+        # ---- load config (also populates proxy_list / website_list) ------
+        self._load_config()
+        self._dark_mode: bool = bool(CONFIG.get("dark_mode", False))
+
+        # ---- theming registry: widget → {tk_option: theme_color_key} ----
+        self._themed_widgets: Dict[object, Dict[str, str]] = {}
+
+        # ---- window & fonts ----------------------------------------------
+        self._setup_window()
+        _resolve_fonts()
+
+        # ---- build UI ----------------------------------------------------
+        self._build_layout()
+
+        # ---- window close → save & stop all ------------------------------
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # ---- browser detection in background -----------------------------
+        threading.Thread(
+            target=self._detect_browsers, daemon=True, name="browser-detect"
+        ).start()
+
+        # ---- periodic log-queue drain ------------------------------------
+        self.root.after(100, self._drain_log)
+
+    # ======================================================================
+    # Config  (_load / _save)
+    # ======================================================================
+
+    def _load_config(self) -> None:
+        """Read ~/.browserguard/config.json and merge into CONFIG."""
+        try:
+            if _CONFIG_FILE.exists():
+                data = json.loads(_CONFIG_FILE.read_text(encoding="utf-8"))
+                CONFIG.update(data)
+        except Exception as exc:
+            logger.warning("Could not load config: %s", exc)
+
+        self.proxy_list        = list(CONFIG.get("proxy_list",   []))
+        self.website_list      = list(CONFIG.get("website_list", []))
+        self._selected_browser = str(CONFIG.get("selected_browser", "auto"))
+
+    def _save_config(self) -> None:
+        """Persist current state back to ~/.browserguard/config.json."""
+        try:
+            _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            CONFIG["proxy_list"]       = self.proxy_list
+            CONFIG["website_list"]     = self.website_list
+            CONFIG["selected_browser"] = self._selected_browser
+            CONFIG["dark_mode"]        = self._dark_mode
+            _CONFIG_FILE.write_text(
+                json.dumps(CONFIG, indent=2), encoding="utf-8"
+            )
+        except Exception as exc:
+            logger.warning("Could not save config: %s", exc)
+
+    # ======================================================================
+    # Window setup
+    # ======================================================================
+
+    def _setup_window(self) -> None:
+        """Configure the root Tk window — title, size, minimum dimensions."""
+        self.root.title("BrowserGuard")
+        self.root.minsize(900, 580)
+
+        w  = int(CONFIG.get("window_width",  1280))
+        h  = int(CONFIG.get("window_height", 800))
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+
+        if w >= sw:
+            # Maximise; fall back to -zoomed on platforms without "zoomed" state
+            try:
+                self.root.state("zoomed")
+            except tk.TclError:
+                try:
+                    self.root.attributes("-zoomed", True)
+                except tk.TclError:
+                    pass
+        else:
+            x = max(0, (sw - w) // 2)
+            y = max(0, (sh - h) // 2)
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
+
+        self.root.bind("<Configure>", self._on_resize)
+
+    def _on_resize(self, event: tk.Event) -> None:
+        """Keep CONFIG in sync with the live window dimensions."""
+        if event.widget is self.root:
+            CONFIG["window_width"]  = self.root.winfo_width()
+            CONFIG["window_height"] = self.root.winfo_height()
+
+    def _on_close(self) -> None:
+        """Save geometry + config then destroy the window."""
+        CONFIG["window_width"]  = self.root.winfo_width()
+        CONFIG["window_height"] = self.root.winfo_height()
+        self._stop_all()
+        self._save_config()
+        self.root.destroy()
+
+    # ======================================================================
+    # Theme
+    # ======================================================================
+
+    def _get_colors(self) -> Dict[str, str]:
+        """Return the active colour palette dict."""
+        return THEME["dark"] if self._dark_mode else THEME["light"]
+
+    def _tw(self, widget, **tags: str):
+        """Register *widget* in the theme registry and return it.
+
+        *tags* maps tkinter option names to THEME colour keys, e.g.
+        ``_tw(lbl, background="card", foreground="text")``.
+        """
+        self._themed_widgets[widget] = tags
+        return widget
+
+    def _apply_theme(self) -> None:
+        """Repaint every registered widget using the current colour palette.
+
+        Walks the full widget tree so that widgets added after the initial
+        build are also updated as long as they were registered with :meth:`_tw`.
+        """
+        c = self._get_colors()
+
+        def _walk(w: tk.BaseWidget) -> None:
+            tags = self._themed_widgets.get(w, {})
+            kw   = {opt: c[key] for opt, key in tags.items() if key in c}
+            if kw:
+                try:
+                    w.configure(**kw)
+                except tk.TclError:
+                    pass
+            for child in w.winfo_children():
+                _walk(child)
+
+        _walk(self.root)
+
+        # Segmented control colours are managed separately
+        self._refresh_segmented()
+
+        # Theme-toggle icon
+        if hasattr(self, "_theme_btn"):
+            self._theme_btn.configure(
+                text="☀" if self._dark_mode else "☾",
+                foreground=self._get_colors()["text2"],
+            )
+
+    def _toggle_dark_mode(self) -> None:
+        """Flip between dark and light mode, persist, and repaint."""
+        self._dark_mode = not self._dark_mode
+        self._save_config()
+        self._apply_theme()
+
+    # ======================================================================
+    # Layout  (three-zone structure)
+    # ======================================================================
+
+    def _build_layout(self) -> None:
+        """Build toolbar + sidebar/content split."""
+        self._tw(self.root, background="bg")
+
+        # ── Zone 1: toolbar ───────────────────────────────────────────────
+        self._build_toolbar()
+
+        # ── 1-px horizontal separator ────────────────────────────────────
+        self._tw(tk.Frame(self.root, height=1), background="separator").pack(fill=tk.X)
+
+        # ── Zone 2 & 3: sidebar + content in a shared row ─────────────────
+        main = self._tw(tk.Frame(self.root), background="bg")
+        main.pack(fill=tk.BOTH, expand=True)
+
+        self._build_sidebar(main)
+
+        # 1-px vertical divider between sidebar and content
+        self._tw(tk.Frame(main, width=1), background="separator").pack(
+            side=tk.LEFT, fill=tk.Y
+        )
+
+        self._build_content(main)
+
+    # ======================================================================
+    # Toolbar
+    # ======================================================================
+
+    def _build_toolbar(self) -> None:
+        """48-px top bar: logo · segmented control · spacer · toggle · badge · new-btn."""
+        bar = self._tw(tk.Frame(self.root, height=_TOOLBAR_H), background="toolbar")
+        bar.pack(fill=tk.X)
+        bar.pack_propagate(False)
+
+        # ── Logo ──────────────────────────────────────────────────────────
+        self._tw(
+            tk.Label(bar, text="BrowserGuard", font=f(15, "bold"), padx=16),
+            background="toolbar", foreground="text",
+        ).pack(side=tk.LEFT)
+
+        # ── Browser segmented control ────────────────────────────────────
+        # Outer frame acts as the 1-px border via its background colour.
+        seg_outer = self._tw(
+            tk.Frame(bar, bd=1, relief=tk.FLAT),
+            background="separator",
+        )
+        seg_outer.pack(side=tk.LEFT, padx=(0, 8), pady=10)
+
+        self._seg_brave = tk.Label(
+            seg_outer, text="Brave", font=f(12), padx=12, pady=2, cursor="hand2"
+        )
+        self._seg_brave.pack(side=tk.LEFT)
+        self._seg_brave.bind("<Button-1>", lambda _e: self._switch_browser("brave"))
+
+        # 1-px divider between the two segments
+        self._tw(
+            tk.Frame(seg_outer, width=1), background="separator"
+        ).pack(side=tk.LEFT, fill=tk.Y)
+
+        self._seg_chrome = tk.Label(
+            seg_outer, text="Chrome", font=f(12), padx=12, pady=2, cursor="hand2"
+        )
+        self._seg_chrome.pack(side=tk.LEFT)
+        self._seg_chrome.bind("<Button-1>", lambda _e: self._switch_browser("chrome"))
+
+        # Register with empty tags — _refresh_segmented owns their colours
+        self._themed_widgets[self._seg_brave]  = {}
+        self._themed_widgets[self._seg_chrome] = {}
+
+        # ── Spacer ────────────────────────────────────────────────────────
+        self._tw(
+            tk.Frame(bar), background="toolbar"
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # ── Dark / light toggle ───────────────────────────────────────────
+        self._theme_btn = self._tw(
+            tk.Label(
+                bar,
+                text="☾" if not self._dark_mode else "☀",
+                font=f(16), padx=10, cursor="hand2",
+            ),
+            background="toolbar", foreground="text2",
+        )
+        self._theme_btn.pack(side=tk.LEFT, pady=6)
+        self._theme_btn.bind("<Button-1>", lambda _e: self._toggle_dark_mode())
+
+        # ── Session count badge ───────────────────────────────────────────
+        self._badge_var = tk.StringVar(value="0 active")
+        self._tw(
+            tk.Label(bar, textvariable=self._badge_var, font=f(11), padx=10),
+            background="toolbar", foreground="text2",
+        ).pack(side=tk.LEFT, pady=6)
+
+        # ── ＋ New Session button ─────────────────────────────────────────
+        new_btn = self._tw(
+            tk.Label(
+                bar, text="＋ New Session", font=f(12, "bold"),
+                padx=14, pady=4, cursor="hand2",
+            ),
+            background="accent", foreground="card",
+        )
+        new_btn.pack(side=tk.LEFT, padx=(4, 12), pady=8)
+        new_btn.bind("<Button-1>", lambda _e: self._new_session())
+
+        # Paint the segmented control for the first time
+        self._refresh_segmented()
+
+    # ======================================================================
+    # Sidebar
+    # ======================================================================
+
+    def _build_sidebar(self, parent: tk.Frame) -> None:
+        """260-px left panel: search input · scrollable cards · Stop All."""
+        sidebar = self._tw(tk.Frame(parent, width=_SIDEBAR_W), background="bg")
+        sidebar.pack(side=tk.LEFT, fill=tk.Y)
+        sidebar.pack_propagate(False)
+
+        # ── Search input ──────────────────────────────────────────────────
+        s_wrap = self._tw(tk.Frame(sidebar, pady=8), background="bg")
+        s_wrap.pack(fill=tk.X, padx=12)
+
+        self._search_var = tk.StringVar()
+        self._search_var.trace_add("write", lambda *_: self._filter_cards())
+
+        self._search_entry = self._tw(
+            tk.Entry(
+                s_wrap,
+                textvariable=self._search_var,
+                font=f(12), relief=tk.FLAT, bd=0,
+            ),
+            background="card", foreground="text",
+            insertbackground="text",
+            highlightbackground="separator", highlightcolor="accent",
+        )
+        self._search_entry.pack(fill=tk.X, ipady=6, padx=2)
+        self._set_placeholder(self._search_entry, "Search sessions…")
+
+        self._tw(
+            tk.Frame(sidebar, height=1), background="separator"
+        ).pack(fill=tk.X, padx=12)
+
+        # ── Scrollable session-card area ──────────────────────────────────
+        canvas_wrap = self._tw(tk.Frame(sidebar), background="bg")
+        canvas_wrap.pack(fill=tk.BOTH, expand=True)
+
+        self._cards_canvas = self._tw(
+            tk.Canvas(canvas_wrap, highlightthickness=0, bd=0),
+            background="bg",
+        )
+        self._cards_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        cards_sb = ttk.Scrollbar(
+            canvas_wrap, orient=tk.VERTICAL, command=self._cards_canvas.yview
+        )
+        cards_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._cards_canvas.configure(yscrollcommand=cards_sb.set)
+
+        self._cards_inner = self._tw(
+            tk.Frame(self._cards_canvas), background="bg"
+        )
+        self._cards_win = self._cards_canvas.create_window(
+            (0, 0), window=self._cards_inner, anchor="nw"
+        )
+
+        self._cards_inner.bind("<Configure>", self._on_cards_configure)
+        self._cards_canvas.bind("<Configure>", self._on_canvas_configure)
+
+        # ── Stop All (destructive, pinned to bottom) ──────────────────────
+        stop_all = self._tw(
+            tk.Label(
+                sidebar, text="⏹  Stop All", font=f(12, "bold"),
+                padx=12, pady=8, cursor="hand2",
+            ),
+            background="danger", foreground="card",
+        )
+        stop_all.pack(fill=tk.X, padx=12, pady=(4, 12))
+        stop_all.bind("<Button-1>", lambda _e: self._stop_all())
+
+    def _on_cards_configure(self, _event: object) -> None:
+        self._cards_canvas.configure(
+            scrollregion=self._cards_canvas.bbox("all")
+        )
+
+    def _on_canvas_configure(self, event: tk.Event) -> None:
+        self._cards_canvas.itemconfigure(self._cards_win, width=event.width)
+
+    # ======================================================================
+    # Content area  (placeholder — pages added later)
+    # ======================================================================
+
+    def _build_content(self, parent: tk.Frame) -> None:
+        self._content_frame = self._tw(
+            tk.Frame(parent), background="bg"
+        )
+        self._content_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    # ======================================================================
+    # Browser detection & segmented control
+    # ======================================================================
+
+    def _detect_browsers(self) -> None:
+        """Run in a background thread; update paths then refresh the UI."""
+        brave  = find_brave()
+        chrome = find_chrome()
+        self._brave_path  = brave
+        self._chrome_path = chrome
+
+        # Pick an initial browser path consistent with the saved preference
+        sel = self._selected_browser
+        if sel == "brave" and brave:
+            self._browser_path = brave
+        elif sel == "chrome" and chrome:
+            self._browser_path = chrome
+        elif brave:
+            self._browser_path     = brave
+            self._selected_browser = "brave"
+        elif chrome:
+            self._browser_path     = chrome
+            self._selected_browser = "chrome"
+
+        logger.debug("Browsers — Brave: %s  Chrome: %s", brave, chrome)
+        # Schedule GUI update on the main thread
+        self.root.after(0, self._refresh_segmented)
+
+    def _switch_browser(self, key: str) -> None:
+        """Select *key* ('brave'|'chrome'), update path, persist, repaint."""
+        if key == "brave":
+            if not self._brave_path:
+                return
+            self._selected_browser = "brave"
+            self._browser_path     = self._brave_path
+        elif key == "chrome":
+            if not self._chrome_path:
+                return
+            self._selected_browser = "chrome"
+            self._browser_path     = self._chrome_path
+        else:
+            return
+        CONFIG["selected_browser"] = self._selected_browser
+        self._save_config()
+        self._refresh_segmented()
+
+    def _refresh_segmented(self) -> None:
+        """Repaint the Brave/Chrome toggle to reflect the active selection."""
+        if not (hasattr(self, "_seg_brave") and hasattr(self, "_seg_chrome")):
+            return
+        c = self._get_colors()
+        for key, widget in (("brave", self._seg_brave), ("chrome", self._seg_chrome)):
+            active = (self._selected_browser == key)
+            widget.configure(
+                background=c["card"]    if active else c["surface2"],
+                foreground=c["text"]    if active else c["text2"],
+                font=f(12, "bold" if active else "normal"),
+            )
+
+    # ======================================================================
+    # Search / card filter
+    # ======================================================================
+
+    def _filter_cards(self) -> None:
+        """Show/hide session cards based on the search-entry contents."""
+        raw   = self._search_var.get()
+        query = "" if raw == "Search sessions…" else raw.lower().strip()
+
+        for sid, card in self.session_cards.items():
+            session = self.sessions.get(sid)
+            if session is None:
+                card.pack_forget()
+                continue
+            if not query or query in session.name.lower() or query in session.url.lower():
+                card.pack(fill=tk.X, padx=8, pady=(0, 4))
+            else:
+                card.pack_forget()
+
+        self._on_cards_configure(None)
+
+    # ======================================================================
+    # Session management stubs
+    # ======================================================================
+
+    def _new_session(self) -> None:
+        """Open the new-session dialog (implemented when content pages are added)."""
+        logger.debug("New session requested")
+
+    def _stop_all(self) -> None:
+        """Terminate every running session."""
+        for session in list(self.sessions.values()):
+            try:
+                session.stop()
+            except Exception as exc:
+                logger.warning("stop_all error [%s]: %s", session.sid, exc)
+        self._update_badge()
+
+    def _update_badge(self) -> None:
+        """Refresh the active-session count badge in the toolbar."""
+        count = sum(1 for s in self.sessions.values() if s.running)
+        self._badge_var.set(f"{count} active")
+
+    # ======================================================================
+    # Placeholder helper for search entry
+    # ======================================================================
+
+    def _set_placeholder(self, entry: tk.Entry, placeholder: str) -> None:
+        """Show greyed placeholder text; clear on focus, restore on blur."""
+        c = self._get_colors()
+
+        def _focus_in(_e: tk.Event) -> None:
+            if entry.get() == placeholder:
+                entry.delete(0, tk.END)
+                try:
+                    entry.configure(foreground=c["text"])
+                except tk.TclError:
+                    pass
+
+        def _focus_out(_e: tk.Event) -> None:
+            if not entry.get():
+                entry.insert(0, placeholder)
+                try:
+                    entry.configure(foreground=c["text3"])
+                except tk.TclError:
+                    pass
+
+        entry.insert(0, placeholder)
+        try:
+            entry.configure(foreground=c["text3"])
+        except tk.TclError:
+            pass
+        entry.bind("<FocusIn>",  _focus_in)
+        entry.bind("<FocusOut>", _focus_out)
+
+    # ======================================================================
+    # Log-queue drain  (called every 100 ms via root.after)
+    # ======================================================================
+
+    def _drain_log(self) -> None:
+        """Forward any queued backend log messages to the Python logger."""
+        try:
+            while True:
+                msg = self.log_queue.get_nowait()
+                logger.info("[session] %s", msg)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._drain_log)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    root = tk.Tk()
+    app  = BrowserGuardApp(root)  # noqa: F841
+    root.mainloop()
+
+
 if __name__ == "__main__":
-    pass
+    main()

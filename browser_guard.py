@@ -1272,6 +1272,8 @@ class BrowserGuardApp:
         stop_all.bind("<Button-1>", lambda _e: self._stop_all())
 
     def _on_cards_configure(self, _event: object) -> None:
+        if not hasattr(self, "_cards_canvas"):
+            return
         self._cards_canvas.configure(
             scrollregion=self._cards_canvas.bbox("all")
         )

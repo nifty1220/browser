@@ -3,9 +3,11 @@
 import logging
 import re
 import time
+import tkinter as tk
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from tkinter import ttk
 from typing import Deque, List, Optional
 from urllib.parse import urlparse
 
@@ -346,3 +348,196 @@ class BrowserSession:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+# ---------------------------------------------------------------------------
+# BrowserGuardApp
+# ---------------------------------------------------------------------------
+
+# Sidebar width in pixels
+SIDEBAR_WIDTH = 200
+
+# Toolbar height in pixels
+TOOLBAR_HEIGHT = 36
+
+# Application title shown in the window title bar
+APP_TITLE = "BrowserGuard"
+
+
+class BrowserGuardApp:
+    """Top-level Tk application for BrowserGuard.
+
+    Layout
+    ------
+    ┌─────────────────────────────────────┐
+    │  Toolbar  (nav bar + action buttons)│
+    ├───────────┬─────────────────────────┤
+    │  Sidebar  │  Content area           │
+    │  (nav /   │  (tab pages added later)│
+    │  sessions)│                         │
+    └───────────┴─────────────────────────┘
+    """
+
+    def __init__(self, root: tk.Tk, session: Optional[BrowserSession] = None) -> None:
+        self.root = root
+        self.session = session
+
+        self._setup_window()
+        self._build_toolbar()
+        self._build_main_area()
+
+    # ------------------------------------------------------------------
+    # Window setup
+    # ------------------------------------------------------------------
+
+    def _setup_window(self) -> None:
+        """Configure the root Tk window."""
+        self.root.title(APP_TITLE)
+        self.root.minsize(800, 600)
+        self.root.resizable(True, True)
+
+        # Let the content column expand when the window is resized
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=1)  # row 0 = toolbar, row 1 = main area
+
+        logger.debug("Window configured: %s", APP_TITLE)
+
+    # ------------------------------------------------------------------
+    # Toolbar
+    # ------------------------------------------------------------------
+
+    def _build_toolbar(self) -> None:
+        """Create the toolbar row at the top of the window."""
+        self.toolbar = tk.Frame(
+            self.root,
+            height=TOOLBAR_HEIGHT,
+            bd=1,
+            relief=tk.RAISED,
+        )
+        self.toolbar.grid(row=0, column=0, sticky="ew")
+        self.toolbar.grid_propagate(False)
+
+        # URL entry field
+        self._url_var = tk.StringVar()
+        self._url_entry = ttk.Entry(self.toolbar, textvariable=self._url_var, width=60)
+        self._url_entry.pack(side=tk.LEFT, padx=(8, 4), pady=4, fill=tk.X, expand=True)
+        self._url_entry.bind("<Return>", self._on_navigate)
+
+        # Navigate button
+        self._nav_btn = ttk.Button(self.toolbar, text="Go", command=self._on_navigate)
+        self._nav_btn.pack(side=tk.LEFT, padx=(0, 4), pady=4)
+
+        # Stop button
+        self._stop_btn = ttk.Button(self.toolbar, text="Stop", command=self._on_stop)
+        self._stop_btn.pack(side=tk.LEFT, padx=(0, 4), pady=4)
+
+        # Refresh button
+        self._refresh_btn = ttk.Button(self.toolbar, text="Refresh", command=self._on_refresh)
+        self._refresh_btn.pack(side=tk.LEFT, padx=(0, 8), pady=4)
+
+        logger.debug("Toolbar built")
+
+    # ------------------------------------------------------------------
+    # Main area (sidebar + content)
+    # ------------------------------------------------------------------
+
+    def _build_main_area(self) -> None:
+        """Create the paned container that holds the sidebar and content area."""
+        self._pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        self._pane.grid(row=1, column=0, sticky="nsew")
+
+        self._build_sidebar()
+        self._build_content_area()
+
+    def _build_sidebar(self) -> None:
+        """Create the sidebar panel on the left."""
+        self.sidebar = ttk.Frame(self._pane, width=SIDEBAR_WIDTH)
+        self.sidebar.pack_propagate(False)
+        self._pane.add(self.sidebar, weight=0)
+
+        # Section label
+        ttk.Label(self.sidebar, text="Sessions", font=("TkDefaultFont", 10, "bold")).pack(
+            anchor="w", padx=8, pady=(8, 2)
+        )
+
+        # Session list box
+        self._session_listbox = tk.Listbox(self.sidebar, selectmode=tk.SINGLE)
+        self._session_listbox.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
+        self._session_listbox.bind("<<ListboxSelect>>", self._on_session_select)
+
+        # Sidebar action buttons
+        btn_frame = ttk.Frame(self.sidebar)
+        btn_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
+
+        self._new_session_btn = ttk.Button(
+            btn_frame, text="New Session", command=self._on_new_session
+        )
+        self._new_session_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
+
+        self._close_session_btn = ttk.Button(
+            btn_frame, text="Close", command=self._on_close_session
+        )
+        self._close_session_btn.pack(side=tk.LEFT, expand=True, fill=tk.X)
+
+        logger.debug("Sidebar built")
+
+    def _build_content_area(self) -> None:
+        """Create the right-hand content frame (tab pages will be added later)."""
+        self.content = ttk.Frame(self._pane)
+        self._pane.add(self.content, weight=1)
+
+        # Placeholder label until tab pages are wired up
+        self._placeholder = ttk.Label(
+            self.content,
+            text="Select a session or open a new one.",
+            anchor="center",
+        )
+        self._placeholder.pack(fill=tk.BOTH, expand=True)
+
+        logger.debug("Content area built")
+
+    # ------------------------------------------------------------------
+    # Toolbar callbacks (stubs)
+    # ------------------------------------------------------------------
+
+    def _on_navigate(self, _event: Optional[tk.Event] = None) -> None:
+        """Called when the user presses Go or hits Enter in the URL bar."""
+        url = sanitize_url(self._url_var.get())
+        logger.info("Navigate requested: %s", url)
+
+    def _on_stop(self) -> None:
+        """Called when the user clicks Stop."""
+        logger.info("Stop requested")
+
+    def _on_refresh(self) -> None:
+        """Called when the user clicks Refresh."""
+        logger.info("Refresh requested")
+
+    # ------------------------------------------------------------------
+    # Sidebar callbacks (stubs)
+    # ------------------------------------------------------------------
+
+    def _on_session_select(self, _event: tk.Event) -> None:
+        """Called when the user selects a session in the sidebar list."""
+        selection = self._session_listbox.curselection()
+        if selection:
+            logger.debug("Session selected: index=%d", selection[0])
+
+    def _on_new_session(self) -> None:
+        """Called when the user clicks New Session."""
+        logger.info("New session requested")
+
+    def _on_close_session(self) -> None:
+        """Called when the user clicks Close in the sidebar."""
+        logger.info("Close session requested")
+
+    # ------------------------------------------------------------------
+    # Entry point
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def run(cls) -> None:
+        """Create the Tk root, instantiate the app, and enter the event loop."""
+        root = tk.Tk()
+        cls(root)
+        root.mainloop()

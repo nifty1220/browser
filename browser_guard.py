@@ -369,13 +369,14 @@ class BrowserGuardApp:
 
     Layout
     ------
-    ┌─────────────────────────────────────┐
-    │  Toolbar  (nav bar + action buttons)│
-    ├───────────┬─────────────────────────┤
-    │  Sidebar  │  Content area           │
-    │  (nav /   │  (tab pages added later)│
-    │  sessions)│                         │
-    └───────────┴─────────────────────────┘
+    ┌──────────────────────────────────────────────┐
+    │  Toolbar  (URL entry · Go · Stop · Refresh)  │
+    ├───────────┬──────────────────────────────────┤
+    │  Sidebar  │ [Launcher][Websites][Proxies][Log]│
+    │  Sessions │  tab content                     │
+    │  listbox  │                                  │
+    │ [New][Cls]│                                  │
+    └───────────┴──────────────────────────────────┘
     """
 
     def __init__(self, root: tk.Tk, session: Optional[BrowserSession] = None) -> None:
@@ -482,19 +483,286 @@ class BrowserGuardApp:
         logger.debug("Sidebar built")
 
     def _build_content_area(self) -> None:
-        """Create the right-hand content frame (tab pages will be added later)."""
+        """Create the right-hand content frame containing the tab notebook."""
         self.content = ttk.Frame(self._pane)
         self._pane.add(self.content, weight=1)
 
-        # Placeholder label until tab pages are wired up
-        self._placeholder = ttk.Label(
-            self.content,
-            text="Select a session or open a new one.",
-            anchor="center",
-        )
-        self._placeholder.pack(fill=tk.BOTH, expand=True)
+        self.content.columnconfigure(0, weight=1)
+        self.content.rowconfigure(0, weight=1)
 
-        logger.debug("Content area built")
+        self._notebook = ttk.Notebook(self.content)
+        self._notebook.grid(row=0, column=0, sticky="nsew")
+
+        self._build_tab_launcher()
+        self._build_tab_websites()
+        self._build_tab_proxies()
+        self._build_tab_log()
+
+        logger.debug("Content area built with %d tabs", self._notebook.index("end"))
+
+    # ------------------------------------------------------------------
+    # Tab: Launcher
+    # ------------------------------------------------------------------
+
+    def _build_tab_launcher(self) -> None:
+        """Build the Launcher tab — start/stop sessions and set guard options."""
+        tab = ttk.Frame(self._notebook, padding=12)
+        self._notebook.add(tab, text="Launcher")
+
+        # -- Session identity ------------------------------------------
+        id_frame = ttk.LabelFrame(tab, text="Session", padding=8)
+        id_frame.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(id_frame, text="Session ID:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self._launch_id_var = tk.StringVar(value="session-1")
+        ttk.Entry(id_frame, textvariable=self._launch_id_var, width=30).grid(
+            row=0, column=1, sticky="ew"
+        )
+        id_frame.columnconfigure(1, weight=1)
+
+        # -- Guard options ---------------------------------------------
+        opt_frame = ttk.LabelFrame(tab, text="Guard Options", padding=8)
+        opt_frame.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(opt_frame, text="Rate limit (req/s):").grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
+        )
+        self._launch_rps_var = tk.IntVar(value=RATE_LIMIT_RPS)
+        ttk.Spinbox(opt_frame, from_=1, to=100, textvariable=self._launch_rps_var, width=8).grid(
+            row=0, column=1, sticky="w"
+        )
+
+        ttk.Label(opt_frame, text="Nav timeout (s):").grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=(4, 0)
+        )
+        self._launch_timeout_var = tk.DoubleVar(value=NAV_TIMEOUT_SECONDS)
+        ttk.Spinbox(
+            opt_frame, from_=1, to=300, textvariable=self._launch_timeout_var, width=8
+        ).grid(row=1, column=1, sticky="w", pady=(4, 0))
+
+        self._launch_use_proxy_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            opt_frame, text="Use proxy tunnel", variable=self._launch_use_proxy_var
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        # -- Action buttons -------------------------------------------
+        btn_frame = ttk.Frame(tab)
+        btn_frame.pack(anchor="w", pady=(4, 0))
+
+        self._launch_start_btn = ttk.Button(
+            btn_frame, text="Start Session", command=self._on_launch_start
+        )
+        self._launch_start_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        self._launch_stop_btn = ttk.Button(
+            btn_frame, text="Stop Session", command=self._on_launch_stop, state=tk.DISABLED
+        )
+        self._launch_stop_btn.pack(side=tk.LEFT)
+
+        # -- Status label ---------------------------------------------
+        self._launch_status_var = tk.StringVar(value="No session running.")
+        ttk.Label(tab, textvariable=self._launch_status_var, foreground="gray").pack(
+            anchor="w", pady=(8, 0)
+        )
+
+        logger.debug("Tab 'Launcher' built")
+
+    # ------------------------------------------------------------------
+    # Tab: Websites
+    # ------------------------------------------------------------------
+
+    def _build_tab_websites(self) -> None:
+        """Build the Websites tab — manage allowed/blocked domain lists."""
+        tab = ttk.Frame(self._notebook, padding=12)
+        self._notebook.add(tab, text="Websites")
+
+        tab.columnconfigure(0, weight=1)
+        tab.columnconfigure(2, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        # -- Allowed column -------------------------------------------
+        ttk.Label(tab, text="Allowed Domains", font=("TkDefaultFont", 9, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(0, 4)
+        )
+        self._allowed_listbox = tk.Listbox(tab, selectmode=tk.SINGLE)
+        self._allowed_listbox.grid(row=1, column=0, sticky="nsew")
+
+        allowed_btn_frame = ttk.Frame(tab)
+        allowed_btn_frame.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        self._allowed_entry_var = tk.StringVar()
+        ttk.Entry(allowed_btn_frame, textvariable=self._allowed_entry_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4)
+        )
+        ttk.Button(allowed_btn_frame, text="Add", command=self._on_allowed_add).pack(side=tk.LEFT)
+        ttk.Button(allowed_btn_frame, text="Remove", command=self._on_allowed_remove).pack(
+            side=tk.LEFT, padx=(4, 0)
+        )
+
+        # Spacer column
+        ttk.Separator(tab, orient=tk.VERTICAL).grid(
+            row=0, column=1, rowspan=3, sticky="ns", padx=10
+        )
+
+        # -- Blocked column -------------------------------------------
+        ttk.Label(tab, text="Blocked Domains", font=("TkDefaultFont", 9, "bold")).grid(
+            row=0, column=2, sticky="w", pady=(0, 4)
+        )
+        self._blocked_listbox = tk.Listbox(tab, selectmode=tk.SINGLE)
+        self._blocked_listbox.grid(row=1, column=2, sticky="nsew")
+
+        blocked_btn_frame = ttk.Frame(tab)
+        blocked_btn_frame.grid(row=2, column=2, sticky="ew", pady=(4, 0))
+        self._blocked_entry_var = tk.StringVar()
+        ttk.Entry(blocked_btn_frame, textvariable=self._blocked_entry_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4)
+        )
+        ttk.Button(blocked_btn_frame, text="Add", command=self._on_blocked_add).pack(side=tk.LEFT)
+        ttk.Button(blocked_btn_frame, text="Remove", command=self._on_blocked_remove).pack(
+            side=tk.LEFT, padx=(4, 0)
+        )
+
+        logger.debug("Tab 'Websites' built")
+
+    # ------------------------------------------------------------------
+    # Tab: Proxies
+    # ------------------------------------------------------------------
+
+    def _build_tab_proxies(self) -> None:
+        """Build the Proxies tab — configure and manage ProxyTunnel entries."""
+        tab = ttk.Frame(self._notebook, padding=12)
+        self._notebook.add(tab, text="Proxies")
+
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        # -- Proxy form ------------------------------------------------
+        form = ttk.LabelFrame(tab, text="Add Proxy", padding=8)
+        form.pack(fill=tk.X, pady=(0, 8))
+        form.columnconfigure(1, weight=1)
+        form.columnconfigure(3, weight=1)
+
+        ttk.Label(form, text="Host:").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        self._proxy_host_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self._proxy_host_var).grid(
+            row=0, column=1, sticky="ew", padx=(0, 12)
+        )
+
+        ttk.Label(form, text="Port:").grid(row=0, column=2, sticky="w", padx=(0, 4))
+        self._proxy_port_var = tk.IntVar(value=8080)
+        ttk.Spinbox(form, from_=1, to=65535, textvariable=self._proxy_port_var, width=8).grid(
+            row=0, column=3, sticky="w"
+        )
+
+        ttk.Label(form, text="Username:").grid(
+            row=1, column=0, sticky="w", padx=(0, 4), pady=(4, 0)
+        )
+        self._proxy_user_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self._proxy_user_var).grid(
+            row=1, column=1, sticky="ew", pady=(4, 0), padx=(0, 12)
+        )
+
+        ttk.Label(form, text="Password:").grid(
+            row=1, column=2, sticky="w", padx=(0, 4), pady=(4, 0)
+        )
+        self._proxy_pass_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self._proxy_pass_var, show="*").grid(
+            row=1, column=3, sticky="ew", pady=(4, 0)
+        )
+
+        ttk.Button(form, text="Add Proxy", command=self._on_proxy_add).grid(
+            row=2, column=0, columnspan=4, sticky="w", pady=(8, 0)
+        )
+
+        # -- Proxy list ------------------------------------------------
+        ttk.Label(tab, text="Configured Proxies", font=("TkDefaultFont", 9, "bold")).pack(
+            anchor="w", pady=(0, 4)
+        )
+
+        list_frame = ttk.Frame(tab)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+
+        cols = ("address", "status", "requests")
+        self._proxy_tree = ttk.Treeview(
+            list_frame, columns=cols, show="headings", selectmode="browse"
+        )
+        self._proxy_tree.heading("address", text="Address")
+        self._proxy_tree.heading("status", text="Status")
+        self._proxy_tree.heading("requests", text="Requests")
+        self._proxy_tree.column("address", width=220)
+        self._proxy_tree.column("status", width=90, anchor="center")
+        self._proxy_tree.column("requests", width=80, anchor="center")
+        self._proxy_tree.grid(row=0, column=0, sticky="nsew")
+
+        proxy_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self._proxy_tree.yview)
+        self._proxy_tree.configure(yscrollcommand=proxy_scroll.set)
+        proxy_scroll.grid(row=0, column=1, sticky="ns")
+
+        ttk.Button(tab, text="Remove Selected", command=self._on_proxy_remove).pack(
+            anchor="w", pady=(4, 0)
+        )
+
+        logger.debug("Tab 'Proxies' built")
+
+    # ------------------------------------------------------------------
+    # Tab: Log
+    # ------------------------------------------------------------------
+
+    def _build_tab_log(self) -> None:
+        """Build the Log tab — scrollable read-only view of guard activity."""
+        tab = ttk.Frame(self._notebook, padding=12)
+        self._notebook.add(tab, text="Log")
+
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+
+        # -- Log text widget -------------------------------------------
+        log_frame = ttk.Frame(tab)
+        log_frame.grid(row=0, column=0, sticky="nsew")
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+
+        self._log_text = tk.Text(
+            log_frame,
+            state=tk.DISABLED,
+            wrap=tk.NONE,
+            font=("TkFixedFont", 9),
+        )
+        self._log_text.grid(row=0, column=0, sticky="nsew")
+
+        log_v_scroll = ttk.Scrollbar(
+            log_frame, orient=tk.VERTICAL, command=self._log_text.yview
+        )
+        self._log_text.configure(yscrollcommand=log_v_scroll.set)
+        log_v_scroll.grid(row=0, column=1, sticky="ns")
+
+        log_h_scroll = ttk.Scrollbar(
+            log_frame, orient=tk.HORIZONTAL, command=self._log_text.xview
+        )
+        self._log_text.configure(xscrollcommand=log_h_scroll.set)
+        log_h_scroll.grid(row=1, column=0, sticky="ew")
+
+        # Colour tags for log levels
+        self._log_text.tag_configure("INFO", foreground="#1a73e8")
+        self._log_text.tag_configure("WARNING", foreground="#f4a100")
+        self._log_text.tag_configure("ERROR", foreground="#d93025")
+        self._log_text.tag_configure("DEBUG", foreground="#5f6368")
+
+        # -- Controls --------------------------------------------------
+        ctrl_frame = ttk.Frame(tab)
+        ctrl_frame.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+
+        self._log_autoscroll_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            ctrl_frame, text="Auto-scroll", variable=self._log_autoscroll_var
+        ).pack(side=tk.LEFT)
+
+        ttk.Button(ctrl_frame, text="Clear", command=self._on_log_clear).pack(
+            side=tk.RIGHT
+        )
+
+        logger.debug("Tab 'Log' built")
 
     # ------------------------------------------------------------------
     # Toolbar callbacks (stubs)
@@ -530,6 +798,101 @@ class BrowserGuardApp:
     def _on_close_session(self) -> None:
         """Called when the user clicks Close in the sidebar."""
         logger.info("Close session requested")
+
+    # ------------------------------------------------------------------
+    # Launcher tab callbacks (stubs)
+    # ------------------------------------------------------------------
+
+    def _on_launch_start(self) -> None:
+        """Start a new BrowserSession with the options from the Launcher tab."""
+        session_id = self._launch_id_var.get().strip()
+        rps = self._launch_rps_var.get()
+        timeout = self._launch_timeout_var.get()
+        logger.info("Launch start: id=%r rps=%d timeout=%s", session_id, rps, timeout)
+        self._launch_status_var.set(f"Session '{session_id}' running.")
+        self._launch_start_btn.configure(state=tk.DISABLED)
+        self._launch_stop_btn.configure(state=tk.NORMAL)
+
+    def _on_launch_stop(self) -> None:
+        """Stop the currently running session."""
+        logger.info("Launch stop requested")
+        self._launch_status_var.set("No session running.")
+        self._launch_start_btn.configure(state=tk.NORMAL)
+        self._launch_stop_btn.configure(state=tk.DISABLED)
+
+    # ------------------------------------------------------------------
+    # Websites tab callbacks (stubs)
+    # ------------------------------------------------------------------
+
+    def _on_allowed_add(self) -> None:
+        domain = self._allowed_entry_var.get().strip()
+        if domain:
+            self._allowed_listbox.insert(tk.END, domain)
+            self._allowed_entry_var.set("")
+            logger.info("Allowed domain added: %s", domain)
+
+    def _on_allowed_remove(self) -> None:
+        sel = self._allowed_listbox.curselection()
+        if sel:
+            domain = self._allowed_listbox.get(sel[0])
+            self._allowed_listbox.delete(sel[0])
+            logger.info("Allowed domain removed: %s", domain)
+
+    def _on_blocked_add(self) -> None:
+        domain = self._blocked_entry_var.get().strip()
+        if domain:
+            self._blocked_listbox.insert(tk.END, domain)
+            self._blocked_entry_var.set("")
+            logger.info("Blocked domain added: %s", domain)
+
+    def _on_blocked_remove(self) -> None:
+        sel = self._blocked_listbox.curselection()
+        if sel:
+            domain = self._blocked_listbox.get(sel[0])
+            self._blocked_listbox.delete(sel[0])
+            logger.info("Blocked domain removed: %s", domain)
+
+    # ------------------------------------------------------------------
+    # Proxies tab callbacks (stubs)
+    # ------------------------------------------------------------------
+
+    def _on_proxy_add(self) -> None:
+        host = self._proxy_host_var.get().strip()
+        port = self._proxy_port_var.get()
+        if host:
+            self._proxy_tree.insert("", tk.END, values=(f"{host}:{port}", "idle", 0))
+            self._proxy_host_var.set("")
+            logger.info("Proxy added: %s:%d", host, port)
+
+    def _on_proxy_remove(self) -> None:
+        sel = self._proxy_tree.selection()
+        if sel:
+            values = self._proxy_tree.item(sel[0], "values")
+            self._proxy_tree.delete(sel[0])
+            logger.info("Proxy removed: %s", values[0] if values else "?")
+
+    # ------------------------------------------------------------------
+    # Log tab callbacks
+    # ------------------------------------------------------------------
+
+    def _on_log_clear(self) -> None:
+        """Clear all text from the Log tab."""
+        self._log_text.configure(state=tk.NORMAL)
+        self._log_text.delete("1.0", tk.END)
+        self._log_text.configure(state=tk.DISABLED)
+        logger.debug("Log cleared")
+
+    def append_log(self, message: str, level: str = "INFO") -> None:
+        """Append *message* to the Log tab text widget.
+
+        *level* should be one of ``DEBUG``, ``INFO``, ``WARNING``, ``ERROR``.
+        The text is colour-tagged accordingly.
+        """
+        self._log_text.configure(state=tk.NORMAL)
+        self._log_text.insert(tk.END, message + "\n", level.upper())
+        self._log_text.configure(state=tk.DISABLED)
+        if self._log_autoscroll_var.get():
+            self._log_text.see(tk.END)
 
     # ------------------------------------------------------------------
     # Entry point

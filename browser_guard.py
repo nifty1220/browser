@@ -901,6 +901,272 @@ import queue
 # UI constants
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# SessionCard — Apple-style sidebar card for a single browser session
+# ---------------------------------------------------------------------------
+
+
+class SessionCard(tk.Frame):
+    """Apple-style sidebar card for a single browser session.
+
+    Features
+    --------
+    * 3-px left accent bar (accent color) visible only when selected.
+    * Row 1: session name (semibold) + status pill badge (right-aligned).
+    * Row 2: URL truncated monospaced + uptime counter (right-aligned).
+    * Row 3: proxy host caption (text3 color), shown only when proxy active.
+    * ✕ stop button: hidden by default, appears on <Enter>, hides on <Leave>.
+    * Click → select (highlight: #EBF3FF light / #0A2545 dark background).
+    """
+
+    _SEL_LIGHT: str = "#EBF3FF"
+    _SEL_DARK:  str = "#0A2545"
+
+    def __init__(
+        self,
+        parent: tk.Widget,
+        *,
+        app: "BrowserGuardApp",
+        session: "BrowserSession",
+    ) -> None:
+        c = app._get_colors()
+        super().__init__(parent, cursor="hand2", background=c["card"])
+        self._app:            "BrowserGuardApp" = app
+        self._session:        "BrowserSession"  = session
+        self._selected:       bool              = False
+        self._current_status: str               = "running"
+        self._rows:           List[tk.Frame]    = []
+        self._build(c)
+
+    # ------------------------------------------------------------------
+    # Build
+    # ------------------------------------------------------------------
+
+    def _build(self, c: dict) -> None:
+        bg = c["card"]
+
+        # 3-px accent bar (always present; matches card bg when unselected)
+        self._accent_bar = tk.Frame(self, width=3, background=bg)
+        self._accent_bar.pack(side=tk.LEFT, fill=tk.Y)
+        self._accent_bar.pack_propagate(False)
+
+        # Content area
+        self._content = tk.Frame(self, background=bg)
+        self._content.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
+                           padx=(4, 0), pady=4)
+
+        # ── Row 1: name · stop btn · status pill ──────────────────────
+        row1 = tk.Frame(self._content, background=bg)
+        row1.pack(fill=tk.X)
+        self._rows.append(row1)
+
+        self._name_lbl = tk.Label(
+            row1, text=self._session.name, font=f(12, "bold"),
+            anchor="w", background=bg, foreground=c["text"],
+        )
+        self._name_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Status pill badge
+        pill_color = c["success"]
+        self._pill_frame = tk.Frame(row1, background=pill_color, padx=4, pady=1)
+        self._pill_frame.pack(side=tk.RIGHT, padx=(2, 4))
+        self._pill_lbl = tk.Label(
+            self._pill_frame, text="running",
+            font=f(9, "bold"), background=pill_color, foreground="#FFFFFF",
+        )
+        self._pill_lbl.pack()
+
+        # Stop button (always packed but text="" until hover)
+        self._stop_btn = tk.Label(
+            row1, text="", font=f(11), width=2, anchor="center",
+            cursor="hand2", background=bg, foreground=c["danger"],
+        )
+        self._stop_btn.pack(side=tk.RIGHT)
+        self._stop_btn.bind(
+            "<Button-1>",
+            lambda _e: self._app._stop_session(self._session),
+        )
+
+        # ── Row 2: URL (truncated, monospace) · uptime ────────────────
+        row2 = tk.Frame(self._content, background=bg)
+        row2.pack(fill=tk.X, pady=(2, 0))
+        self._rows.append(row2)
+
+        raw_url = self._session.url or "(no url)"
+        disp_url = (raw_url[:28] + "…") if len(raw_url) > 30 else raw_url
+        self._url_lbl = tk.Label(
+            row2, text=disp_url, font=fm(9),
+            anchor="w", background=bg, foreground=c["text2"],
+        )
+        self._url_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self._uptime_lbl = tk.Label(
+            row2, text="00:00:00", font=fm(9),
+            anchor="e", background=bg, foreground=c["text3"],
+        )
+        self._uptime_lbl.pack(side=tk.RIGHT, padx=(0, 4))
+
+        # ── Row 3: proxy host (only when proxy is active) ─────────────
+        if self._session.proxy:
+            row3 = tk.Frame(self._content, background=bg)
+            row3.pack(fill=tk.X)
+            self._rows.append(row3)
+            parsed = urlparse(self._session.proxy)
+            proxy_host = f"{parsed.hostname}:{parsed.port}"
+            self._proxy_lbl = tk.Label(
+                row3, text=proxy_host, font=f(9),
+                anchor="w", background=bg, foreground=c["text3"],
+            )
+            self._proxy_lbl.pack(side=tk.LEFT)
+
+        # ── Hover / click bindings ────────────────────────────────────
+        self._bind_all_hover(self)
+        self._bind_all_click(self)
+
+    # ------------------------------------------------------------------
+    # Binding helpers
+    # ------------------------------------------------------------------
+
+    def _bind_all_hover(self, w: tk.Widget) -> None:
+        w.bind("<Enter>", self._on_enter)
+        w.bind("<Leave>", self._on_leave)
+        for child in w.winfo_children():
+            self._bind_all_hover(child)
+
+    def _bind_all_click(self, w: tk.Widget) -> None:
+        if w is self._stop_btn:
+            return  # stop btn has its own binding
+        w.bind("<Button-1>", self._on_click)
+        for child in w.winfo_children():
+            self._bind_all_click(child)
+
+    # ------------------------------------------------------------------
+    # Hover — show / hide ✕ with 60 ms debounce to avoid child-flicker
+    # ------------------------------------------------------------------
+
+    def _on_enter(self, _event=None) -> None:
+        if hasattr(self, "_hover_leave_job"):
+            try:
+                self.after_cancel(self._hover_leave_job)
+            except Exception:
+                pass
+            del self._hover_leave_job
+        self._stop_btn.configure(text="✕")
+
+    def _on_leave(self, _event=None) -> None:
+        self._hover_leave_job = self.after(60, self._do_leave)
+
+    def _do_leave(self) -> None:
+        if hasattr(self, "_hover_leave_job"):
+            del self._hover_leave_job
+        self._stop_btn.configure(text="")
+
+    # ------------------------------------------------------------------
+    # Click — selection
+    # ------------------------------------------------------------------
+
+    def _on_click(self, _event=None) -> None:
+        for card in self._app.session_cards.values():
+            if isinstance(card, SessionCard) and card is not self:
+                card.set_selected(False)
+        self.set_selected(True)
+
+    def set_selected(self, selected: bool) -> None:
+        self._selected = selected
+        c = self._app._get_colors()
+        if selected:
+            bg = self._SEL_DARK if self._app._dark_mode else self._SEL_LIGHT
+            self._accent_bar.configure(background=c["accent"])
+        else:
+            bg = c["card"]
+            self._accent_bar.configure(background=bg)
+        self._set_bg(bg)
+
+    # ------------------------------------------------------------------
+    # Background helper (does not touch pill — it has its own color)
+    # ------------------------------------------------------------------
+
+    def _set_bg(self, bg: str) -> None:
+        self.configure(background=bg)
+        self._content.configure(background=bg)
+        for row in self._rows:
+            try:
+                row.configure(background=bg)
+            except Exception:
+                pass
+        for lbl in (self._name_lbl, self._url_lbl,
+                    self._uptime_lbl, self._stop_btn):
+            try:
+                lbl.configure(background=bg)
+            except Exception:
+                pass
+        if hasattr(self, "_proxy_lbl"):
+            try:
+                self._proxy_lbl.configure(background=bg)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Public update API
+    # ------------------------------------------------------------------
+
+    def update_status(self, status: str) -> None:
+        """Repaint the pill badge to reflect the new *status*."""
+        self._current_status = status
+        c = self._app._get_colors()
+        color = {
+            "running":  c["success"],
+            "crashed":  c["danger"],
+            "stopped":  c["text2"],
+            "stopping": c["warning"],
+        }.get(status, c["text2"])
+        try:
+            self._pill_lbl.configure(text=status)
+            self._pill_frame.configure(background=color)
+            self._pill_lbl.configure(background=color)
+        except Exception:
+            pass
+
+    def update_uptime(self) -> None:
+        """Refresh the uptime label."""
+        try:
+            self._uptime_lbl.configure(text=self._session.uptime)
+        except Exception:
+            pass
+
+    def repaint_theme(self, colors: dict) -> None:
+        """Repaint every element for the new theme palette *colors*."""
+        c = colors
+        if self._selected:
+            bg = self._SEL_DARK if self._app._dark_mode else self._SEL_LIGHT
+            self._accent_bar.configure(background=c["accent"])
+        else:
+            bg = c["card"]
+            self._accent_bar.configure(background=bg)
+        self._set_bg(bg)
+        # Text colors
+        self._name_lbl.configure(foreground=c["text"])
+        self._url_lbl.configure(foreground=c["text2"])
+        self._uptime_lbl.configure(foreground=c["text3"])
+        self._stop_btn.configure(foreground=c["danger"])
+        if hasattr(self, "_proxy_lbl"):
+            try:
+                self._proxy_lbl.configure(foreground=c["text3"])
+            except Exception:
+                pass
+        # Pill — keep status color under new palette
+        pill_color = {
+            "running":  c["success"],
+            "crashed":  c["danger"],
+            "stopped":  c["text2"],
+            "stopping": c["warning"],
+        }.get(self._current_status, c["text2"])
+        try:
+            self._pill_frame.configure(background=pill_color)
+            self._pill_lbl.configure(background=pill_color)
+        except Exception:
+            pass
+
 _CONFIG_DIR:  pathlib.Path = pathlib.Path.home() / ".browserguard"
 _CONFIG_FILE: pathlib.Path = _CONFIG_DIR / "config.json"
 _TOOLBAR_H:   int          = 48
@@ -929,6 +1195,7 @@ class BrowserGuardApp:
         self.proxy_index:   int                        = 0
         self.log_queue:     queue.Queue                = queue.Queue()
         self._sid_counter:  int                        = 0
+        self._resize_after_id: Optional[str]           = None
 
         # ---- browser discovery state -------------------------------------
         self._selected_browser: str          = "auto"
@@ -1023,16 +1290,39 @@ class BrowserGuardApp:
         self.root.bind("<Configure>", self._on_resize)
 
     def _on_resize(self, event: tk.Event) -> None:
-        """Keep CONFIG in sync with the live window dimensions."""
+        """Debounce window resize; save dimensions after 500 ms of stillness."""
         if event.widget is self.root:
-            CONFIG["window_width"]  = self.root.winfo_width()
-            CONFIG["window_height"] = self.root.winfo_height()
+            if self._resize_after_id:
+                try:
+                    self.root.after_cancel(self._resize_after_id)
+                except Exception:
+                    pass
+            self._resize_after_id = self.root.after(500, self._save_window_size)
 
-    def _on_close(self) -> None:
-        """Save geometry + config then destroy the window."""
+    def _save_window_size(self) -> None:
+        self._resize_after_id = None
         CONFIG["window_width"]  = self.root.winfo_width()
         CONFIG["window_height"] = self.root.winfo_height()
-        self._stop_all()
+
+    def _on_close(self) -> None:
+        """Confirm if sessions are active; stop all; save config; destroy."""
+        import tkinter.messagebox as mb
+        active = sum(1 for s in self.sessions.values() if s.running)
+        if active:
+            if not mb.askyesno(
+                "BrowserGuard",
+                f"{active} session(s) still running.\nStop all and quit?",
+                icon=mb.WARNING,
+            ):
+                return
+        CONFIG["window_width"]  = self.root.winfo_width()
+        CONFIG["window_height"] = self.root.winfo_height()
+        # Stop all sessions and clean up profiles
+        for session in list(self.sessions.values()):
+            try:
+                session.stop()
+            except Exception as exc:
+                logger.warning("close cleanup error [%s]: %s", session.sid, exc)
         self._save_config()
         self.root.destroy()
 
@@ -1054,14 +1344,19 @@ class BrowserGuardApp:
         return widget
 
     def _apply_theme(self) -> None:
-        """Repaint every registered widget using the current colour palette.
+        """Repaint every widget for the current colour palette.
 
-        Walks the full widget tree so that widgets added after the initial
-        build are also updated as long as they were registered with :meth:`_tw`.
+        Walks the full widget tree.  ``SessionCard`` instances are handed
+        off to their own ``repaint_theme()`` method (their children are
+        handled internally and are not recursed into separately).
         """
         c = self._get_colors()
 
         def _walk(w: tk.BaseWidget) -> None:
+            # SessionCard handles its own subtree
+            if isinstance(w, SessionCard):
+                w.repaint_theme(c)
+                return
             tags = self._themed_widgets.get(w, {})
             kw   = {opt: c[key] for opt, key in tags.items() if key in c}
             if kw:
@@ -1074,15 +1369,45 @@ class BrowserGuardApp:
 
         _walk(self.root)
 
-        # Segmented control colours are managed separately
+        # Segmented control colours
         self._refresh_segmented()
 
         # Theme-toggle icon
         if hasattr(self, "_theme_btn"):
             self._theme_btn.configure(
                 text="☀" if self._dark_mode else "☾",
-                foreground=self._get_colors()["text2"],
+                foreground=c["text2"],
             )
+
+        # Re-apply tab bar active state
+        if hasattr(self, "_active_tab") and hasattr(self, "_tab_labels"):
+            for k, lbl in self._tab_labels.items():
+                active = (k == self._active_tab)
+                lbl.configure(
+                    foreground=c["accent"] if active else c["text2"],
+                    font=f(12, "bold" if active else "normal"),
+                )
+            for k, ul in self._tab_underlines.items():
+                ul.configure(
+                    background=c["accent"] if k == self._active_tab else c["card"]
+                )
+
+        # Re-apply log text widget colours and tags
+        if hasattr(self, "_log_text"):
+            self._log_text.configure(background=c["card"], foreground=c["text"])
+            self._log_text.tag_configure("ts",      foreground=c["text3"])
+            self._log_text.tag_configure("info",    foreground=c["text"])
+            self._log_text.tag_configure("success", foreground=c["success"])
+            self._log_text.tag_configure("warning", foreground=c["warning"])
+            self._log_text.tag_configure("error",   foreground=c["danger"])
+
+        # Re-apply treeview alternating row colours
+        if hasattr(self, "_ws_tree"):
+            self._ws_tree.tag_configure("odd",  background=c["card"])
+            self._ws_tree.tag_configure("even", background=c["surface2"])
+        if hasattr(self, "_px_tree"):
+            self._px_tree.tag_configure("odd",  background=c["card"])
+            self._px_tree.tag_configure("even", background=c["surface2"])
 
     def _toggle_dark_mode(self) -> None:
         """Flip between dark and light mode, persist, and repaint."""
@@ -1095,7 +1420,7 @@ class BrowserGuardApp:
     # ======================================================================
 
     def _build_layout(self) -> None:
-        """Build toolbar + sidebar/content split."""
+        """Build toolbar + sidebar/content split + status bar."""
         self._tw(self.root, background="bg")
 
         # ── Zone 1: toolbar ───────────────────────────────────────────────
@@ -1103,6 +1428,9 @@ class BrowserGuardApp:
 
         # ── 1-px horizontal separator ────────────────────────────────────
         self._tw(tk.Frame(self.root, height=1), background="separator").pack(fill=tk.X)
+
+        # ── Status bar (packed BOTTOM before main so main gets expand) ────
+        self._build_statusbar()
 
         # ── Zone 2 & 3: sidebar + content in a shared row ─────────────────
         main = self._tw(tk.Frame(self.root), background="bg")
@@ -1166,6 +1494,14 @@ class BrowserGuardApp:
         self._tw(
             tk.Frame(bar), background="toolbar"
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # ── Settings gear ─────────────────────────────────────────────────
+        settings_btn = self._tw(
+            tk.Label(bar, text="⚙", font=f(15), padx=8, cursor="hand2"),
+            background="toolbar", foreground="text2",
+        )
+        settings_btn.pack(side=tk.LEFT, pady=6)
+        settings_btn.bind("<Button-1>", lambda _e: self._show_settings_panel())
 
         # ── Dark / light toggle ───────────────────────────────────────────
         self._theme_btn = self._tw(
@@ -1420,8 +1756,9 @@ class BrowserGuardApp:
     # ======================================================================
 
     def _new_session(self) -> None:
-        """Open the new-session dialog (implemented when content pages are added)."""
-        logger.debug("New session requested")
+        """Switch to the Launcher tab to start a new session."""
+        if hasattr(self, "_tab_labels"):
+            self._switch_tab("launcher")
 
     def _stop_all(self) -> None:
         """Terminate every running session."""
@@ -1773,7 +2110,10 @@ class BrowserGuardApp:
         if session:
             self.log(f"[{session.name}] status → {status}")
             card = self.session_cards.get(sid)
-            if card and hasattr(card, "_status_lbl"):
+            if isinstance(card, SessionCard):
+                card.update_status(status)
+            elif card and hasattr(card, "_status_lbl"):
+                # legacy fallback
                 try:
                     c = self._get_colors()
                     color = {
@@ -1787,49 +2127,10 @@ class BrowserGuardApp:
                     pass
 
     def _add_session_card(self, session) -> None:
-        """Create a sidebar card widget for *session*."""
-        c = self._get_colors()
-        card = self._tw(tk.Frame(self._cards_inner, cursor="hand2"), background="card")
+        """Create a SessionCard widget for *session* and add it to the sidebar."""
+        card = SessionCard(self._cards_inner, app=self, session=session)
         card.pack(fill=tk.X, padx=8, pady=(0, 4))
         self.session_cards[session.sid] = card
-
-        top = self._tw(tk.Frame(card), background="card")
-        top.pack(fill=tk.X, padx=8, pady=(6, 2))
-
-        self._tw(
-            tk.Label(top, text=session.name, font=f(12, "bold"), anchor="w"),
-            background="card", foreground="text",
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        stop_btn = self._tw(
-            tk.Label(top, text="✕", font=f(11), cursor="hand2", padx=4),
-            background="card", foreground="danger",
-        )
-        stop_btn.pack(side=tk.RIGHT)
-        stop_btn.bind("<Button-1>", lambda _e, s=session: self._stop_session(s))
-
-        bottom = self._tw(tk.Frame(card), background="card")
-        bottom.pack(fill=tk.X, padx=8, pady=(0, 6))
-
-        status_lbl = self._tw(
-            tk.Label(bottom, text="running", font=f(10), anchor="w"),
-            background="card", foreground=c["success"],
-        )
-        status_lbl.pack(side=tk.LEFT)
-        card._status_lbl = status_lbl
-
-        uptime_lbl = self._tw(
-            tk.Label(bottom, text="00:00:00", font=fm(10), anchor="e"),
-            background="card", foreground="text3",
-        )
-        uptime_lbl.pack(side=tk.RIGHT)
-        card._uptime_lbl = uptime_lbl
-
-        if session.proxy:
-            self._tw(
-                tk.Label(card, text=session.proxy, font=f(9), anchor="w"),
-                background="card", foreground="text3",
-            ).pack(fill=tk.X, padx=8, pady=(0, 4))
 
     def _stop_session(self, session) -> None:
         """Stop a single session and remove its card."""
@@ -1854,14 +2155,17 @@ class BrowserGuardApp:
         self._stat_proxy_var.set(str(len(self.proxy_list)))
 
     def _tick_uptimes(self) -> None:
-        """Update uptime labels on session cards every second."""
+        """Update uptime labels on all session cards every second."""
         for sid, card in list(self.session_cards.items()):
             session = self.sessions.get(sid)
-            if session and hasattr(card, "_uptime_lbl"):
-                try:
-                    card._uptime_lbl.configure(text=session.uptime)
-                except Exception:
-                    pass
+            if session:
+                if isinstance(card, SessionCard):
+                    card.update_uptime()
+                elif hasattr(card, "_uptime_lbl"):
+                    try:
+                        card._uptime_lbl.configure(text=session.uptime)
+                    except Exception:
+                        pass
         self.root.after(1000, self._tick_uptimes)
 
     # ======================================================================
@@ -2336,21 +2640,204 @@ class BrowserGuardApp:
         self.root.after(0, lambda: self._log_append(msg, level))
 
     def _log_append(self, msg: str, level: str = "info") -> None:
-        if not hasattr(self, "_log_text"):
-            return
         import datetime
         ts = datetime.datetime.now().strftime("%H:%M:%S")
-        self._log_text.configure(state=tk.NORMAL)
-        self._log_text.insert("end", f"[{ts}] ", ("ts",))
-        self._log_text.insert("end", f"{msg}\n", (level,))
-        self._log_text.configure(state=tk.DISABLED)
-        self._log_text.see("end")
+        if hasattr(self, "_log_text"):
+            self._log_text.configure(state=tk.NORMAL)
+            self._log_text.insert("end", f"[{ts}] ", ("ts",))
+            self._log_text.insert("end", f"{msg}\n", (level,))
+            self._log_text.configure(state=tk.DISABLED)
+            self._log_text.see("end")
+        # Mirror last message to status bar
+        if hasattr(self, "_status_msg_var"):
+            self._status_msg_var.set(f"[{ts}]  {msg}")
 
     def _log_clear(self) -> None:
         if hasattr(self, "_log_text"):
             self._log_text.configure(state=tk.NORMAL)
             self._log_text.delete("1.0", "end")
             self._log_text.configure(state=tk.DISABLED)
+
+    # ======================================================================
+    # Status bar  (1 line × 20 px, bottom of window)
+    # ======================================================================
+
+    def _build_statusbar(self) -> None:
+        """1-px separator + 20-px bar pinned to the bottom of the root window."""
+        self._tw(
+            tk.Frame(self.root, height=1), background="separator"
+        ).pack(side=tk.BOTTOM, fill=tk.X)
+
+        bar = self._tw(tk.Frame(self.root, height=20), background="toolbar")
+        bar.pack(side=tk.BOTTOM, fill=tk.X)
+        bar.pack_propagate(False)
+
+        self._status_msg_var = tk.StringVar(value="Ready")
+        self._tw(
+            tk.Label(bar, textvariable=self._status_msg_var, font=f(10),
+                     anchor="w", padx=8),
+            background="toolbar", foreground="text2",
+        ).pack(side=tk.LEFT)
+
+        log_path = str(_CONFIG_FILE)
+        self._tw(
+            tk.Label(bar, text=log_path, font=f(10), anchor="e", padx=8),
+            background="toolbar", foreground="text3",
+        ).pack(side=tk.RIGHT)
+
+    # ======================================================================
+    # Settings modal
+    # ======================================================================
+
+    def _show_settings_panel(self) -> None:
+        """Show an iOS-style settings modal with dim overlay."""
+        c = self._get_colors()
+
+        # Dim overlay
+        overlay = tk.Frame(self.root, background="#000000")
+        overlay.place(x=0, y=0, relwidth=1, relheight=1)
+        try:
+            overlay.lift()
+        except Exception:
+            pass
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Settings")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.geometry("480x400")
+        dlg.configure(background=c["bg"])
+
+        def _on_dlg_close() -> None:
+            overlay.destroy()
+            dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", _on_dlg_close)
+
+        # Title
+        tk.Label(
+            dlg, text="Settings", font=f(15, "bold"),
+            background=c["bg"], foreground=c["text"], pady=10,
+        ).pack()
+
+        # ── Simulated rounded card (1-px border via outer frame) ──────────
+        outer = tk.Frame(dlg, background=c["separator"], padx=1, pady=1)
+        outer.pack(fill=tk.X, padx=20, pady=(0, 8))
+        inner_card = tk.Frame(outer, background=c["card"])
+        inner_card.pack(fill=tk.BOTH)
+
+        def _section(parent: tk.Frame, title: str) -> tk.Frame:
+            """Add a section header + separator; return the row frame."""
+            tk.Label(
+                parent, text=title, font=f(9, "bold"),
+                background=c["card"], foreground=c["text3"],
+                anchor="w", padx=12, pady=6,
+            ).pack(fill=tk.X)
+            tk.Frame(parent, height=1, background=c["separator"]).pack(fill=tk.X)
+            row = tk.Frame(parent, background=c["card"], pady=8)
+            row.pack(fill=tk.X, padx=12)
+            return row
+
+        # ── Section: Browser ──────────────────────────────────────────────
+        br_row = _section(inner_card, "BROWSER")
+
+        tk.Label(br_row, text="Path", font=f(11), width=12, anchor="w",
+                 background=c["card"], foreground=c["text2"]).pack(side=tk.LEFT)
+
+        browser_path_var = tk.StringVar(
+            value=CONFIG.get("browser_path", "") or (self._browser_path or "")
+        )
+        browser_entry = tk.Entry(
+            br_row, textvariable=browser_path_var, font=f(11),
+            relief=tk.FLAT, bd=0,
+            background=c["surface2"], foreground=c["text"],
+            insertbackground=c["text"],
+        )
+        browser_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4, padx=(4, 6))
+
+        def _browse() -> None:
+            import tkinter.filedialog as fd
+            path = fd.askopenfilename(title="Select Browser Executable")
+            if path:
+                browser_path_var.set(path)
+
+        browse_btn = tk.Label(
+            br_row, text="Browse", font=f(11), padx=8, pady=2, cursor="hand2",
+            background=c["surface2"], foreground=c["text"],
+        )
+        browse_btn.pack(side=tk.LEFT)
+        browse_btn.bind("<Button-1>", lambda _e: _browse())
+
+        # ── Section: Crash Recovery ───────────────────────────────────────
+        tk.Frame(inner_card, height=1, background=c["separator"]).pack(fill=tk.X)
+        cr_row = _section(inner_card, "CRASH RECOVERY")
+
+        tk.Label(cr_row, text="Max retries", font=f(11), anchor="w",
+                 background=c["card"], foreground=c["text2"]).pack(side=tk.LEFT)
+        retries_var = tk.IntVar(value=int(CONFIG.get("crash_max_retries", 5)))
+        tk.Spinbox(
+            cr_row, from_=0, to=20, textvariable=retries_var,
+            width=4, font=f(11), relief=tk.FLAT, bd=1,
+            background=c["surface2"], foreground=c["text"],
+        ).pack(side=tk.LEFT, padx=(6, 20))
+
+        tk.Label(cr_row, text="Delay (s)", font=f(11), anchor="w",
+                 background=c["card"], foreground=c["text2"]).pack(side=tk.LEFT)
+        delay_var = tk.IntVar(value=int(CONFIG.get("crash_retry_delay", 3)))
+        tk.Spinbox(
+            cr_row, from_=1, to=60, textvariable=delay_var,
+            width=4, font=f(11), relief=tk.FLAT, bd=1,
+            background=c["surface2"], foreground=c["text"],
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+        # ── Section: Proxy ────────────────────────────────────────────────
+        tk.Frame(inner_card, height=1, background=c["separator"]).pack(fill=tk.X)
+        px_row = _section(inner_card, "PROXY")
+
+        tk.Label(px_row, text="Rotate interval (s)", font=f(11), anchor="w",
+                 background=c["card"], foreground=c["text2"]).pack(side=tk.LEFT)
+        rotate_var = tk.IntVar(value=int(CONFIG.get("proxy_rotate_interval", 0)))
+        tk.Spinbox(
+            px_row, from_=0, to=3600, textvariable=rotate_var,
+            width=6, font=f(11), relief=tk.FLAT, bd=1,
+            background=c["surface2"], foreground=c["text"],
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+        # ── Buttons (macOS order: Cancel left, Save right) ────────────────
+        btn_row = tk.Frame(dlg, background=c["bg"])
+        btn_row.pack(fill=tk.X, padx=20, pady=(8, 16))
+
+        cancel_btn = tk.Label(
+            btn_row, text="Cancel", font=f(12),
+            padx=16, pady=6, cursor="hand2",
+            background=c["surface2"], foreground=c["text"],
+        )
+        cancel_btn.pack(side=tk.LEFT)
+        cancel_btn.bind("<Button-1>", lambda _e: _on_dlg_close())
+
+        def _save() -> None:
+            CONFIG["browser_path"]          = browser_path_var.get().strip()
+            CONFIG["crash_max_retries"]     = retries_var.get()
+            CONFIG["crash_retry_delay"]     = delay_var.get()
+            CONFIG["proxy_rotate_interval"] = rotate_var.get()
+            # Apply manual browser path if valid
+            bp = browser_path_var.get().strip()
+            if bp and os.path.isfile(bp):
+                self._browser_path = bp
+            self._save_config()
+            threading.Thread(
+                target=self._detect_browsers, daemon=True, name="browser-detect"
+            ).start()
+            self.log("Settings saved.", "success")
+            _on_dlg_close()
+
+        save_btn = tk.Label(
+            btn_row, text="Save", font=f(12, "bold"),
+            padx=16, pady=6, cursor="hand2",
+            background=c["accent"], foreground=c["card"],
+        )
+        save_btn.pack(side=tk.RIGHT)
+        save_btn.bind("<Button-1>", lambda _e: _save())
 
     # ======================================================================
     # Placeholder helper for search entry

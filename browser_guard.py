@@ -1242,7 +1242,17 @@ class BrowserGuardApp:
             logger.warning("Could not load config: %s", exc)
 
         self.proxy_list        = list(CONFIG.get("proxy_list",   []))
-        self.website_list      = list(CONFIG.get("website_list", []))
+        # Normalize website_list: entries may be dicts (old format) or strings
+        raw_sites = CONFIG.get("website_list", [])
+        self.website_list = []
+        for entry in raw_sites:
+            if isinstance(entry, str):
+                self.website_list.append(entry)
+            elif isinstance(entry, dict):
+                name   = entry.get("name", "")
+                url    = entry.get("url",  "")
+                opens  = str(entry.get("opens", 0))
+                self.website_list.append(f"{name}|{url}|{opens}")
         self._selected_browser = str(CONFIG.get("selected_browser", "auto"))
 
     def _save_config(self) -> None:
